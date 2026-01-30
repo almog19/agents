@@ -1,0 +1,123 @@
+#pip install langchain langchain-community langgraph ollama
+from langgraph.graph import StateGraph, END
+from langchain_ollama import ChatOllama
+from langchain.tools import tool
+from langchain_core.messages import BaseMessage, AIMessage, SystemMessage, HumanMessage, ToolMessage
+from typing import TypedDict
+from langgraph.prebuilt import ToolNode
+from typing_extensions import Annotated
+from langgraph.graph.message import add_messages
+
+import json
+import requests
+
+API_KEY = "d5tld9hr01qtjet07140d5tld9hr01qtjet0714g"
+#define LLM
+llm = ChatOllama(model="mistral", temperature=0)
+
+# ---------------- DEFINE TOOLS ----------------
+@tool
+def get_company_ticket(company: str):
+    """
+    Fetches company search data from Finnhub.
+    Input:
+      company (str): Company name
+    Output:
+      JSON response containing possible ticker symbols or None on failure.
+    """
+    response = requests.get(
+        f"https://finnhub.io/api/v1/search?q={company}&token={API_KEY}"
+    )
+    return response.json() if response.status_code == 200 else {"error": "API failed"}
+
+@tool
+def get_ticket_price(ticket: str):
+    """
+    Fetches the current stock price for a given ticker.
+    Input:
+      ticket (str): Company ticker symbol
+    Output:
+      Current stock price as float or None if unavailable.
+    """
+    response = requests.get(
+        f"https://finnhub.io/api/v1/quote?symbol={ticket}&token={API_KEY}"
+    )
+    if response.status_code != 200:
+        return None
+    price = response.json().get("c")
+    return price if price else {"error": "API failed"}
+
+#bind tool with LLM
+tools = [get_company_ticket,get_ticket_price]
+llm_with_tools = llm.bind_tools(tools)
+
+# ---------------- STATE ----------------
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+# ---------------- NODES ----------------
+def llm_node(state: AgentState):
+    response = llm_with_tools.invoke(state["messages"])
+    return {"messages": [response]}
+tool_node = ToolNode(tools)
+
+def final_node(state: AgentState):
+    """Tell the LLM to look at the history and format the final JSON."""
+    instruction = SystemMessage(content="""
+        Based on the tool outputs above, generate a final report in RAW JSON format, if information is missing specify it:
+        {
+          "company_name": "string",
+          "ticker_name": "string",
+          "price": "float",
+          "currency": "string",
+          "date_of_information": "string",
+          "tool_calls_order": ["list of tools called"]
+        }
+        Return ONLY the JSON. No conversational text.
+    """)
+
+    # We call the LLM one last time to format the data
+    response = llm.invoke(state["messages"] + [instruction])
+    return {"messages": [response]}
+
+# ---------------- ROUTER ----------------
+def route_after_llm(state: AgentState):
+    last = state['messages'][-1]
+    if last.tool_calls:
+        return "tools"
+
+    return "final" #go to final
+# ---------------- GRAPH ----------------
+graph = StateGraph(AgentState)
+
+graph.add_node("llm", llm_node)
+graph.add_node("tools", tool_node)
+graph.add_node("final", final_node)
+
+graph.set_entry_point("llm")
+
+graph.add_conditional_edges("llm",route_after_llm,{"tools": "tools","final": "final"})
+
+graph.add_edge("tools", "llm")
+graph.add_edge("final", END)
+
+agent = graph.compile()
+
+# ---------------- RUN ----------------
+result = agent.invoke({
+    "messages": [
+        SystemMessage(content="""
+You are a stock price retrieval agent.
+You MUST use tools.
+If tools fail → return missing data, and specify the tool has failed and why.
+Never hallucinate.
+Output JSON only.
+"""),
+        HumanMessage(content="What is the current stock price of Google?")
+    ],
+    "steps": []
+})
+
+print(agent.get_graph().draw_ascii())
+for msg in result["messages"]:
+    print(msg.content)
