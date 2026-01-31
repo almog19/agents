@@ -1,4 +1,4 @@
-#pip install langchain langchain-community langgraph ollama
+#pip install langchain langchain_ollamapip  langgraph ollama grandalf
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
 from langchain.tools import tool
@@ -13,7 +13,7 @@ import requests
 
 API_KEY = "d5tld9hr01qtjet07140d5tld9hr01qtjet0714g"
 #define LLM
-llm = ChatOllama(model="mistral", temperature=0)
+llm = ChatOllama(model="qwen2.5:14b", temperature=0)
 
 # ---------------- DEFINE TOOLS ----------------
 @tool
@@ -59,6 +59,7 @@ class AgentState(TypedDict):
 def llm_node(state: AgentState):
     response = llm_with_tools.invoke(state["messages"])
     return {"messages": [response]}
+
 tool_node = ToolNode(tools)
 
 def final_node(state: AgentState):
@@ -70,8 +71,7 @@ def final_node(state: AgentState):
           "ticker_name": "string",
           "price": "float",
           "currency": "string",
-          "date_of_information": "string",
-          "tool_calls_order": ["list of tools called"]
+          "tool_calls_order": ["list of tools called in order"]
         }
         Return ONLY the JSON. No conversational text.
     """)
@@ -119,5 +119,8 @@ Output JSON only.
 })
 
 print(agent.get_graph().draw_ascii())
-for msg in result["messages"]:
-    print(msg.content)
+#print(result['messages'])
+
+#for i, msg in enumerate(result["messages"]):
+#    print(f"{i} -> {msg.content}")
+print(result["messages"][6].content)
