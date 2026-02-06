@@ -8,17 +8,6 @@ Agent
     3) The publisher
         Sensitive agent which ask for permission, it will send emails/post
 """
-"""
-manager promt:
-You are a project manager
-Current Research: {state['research_data']}
-Current Draft: {state['draft_content']}
-
-Decide the next step:
-- If there is no research, return 'RESEARCHER'.
-- If there is research but no draft, return 'WRITER'.
-- If the draft is complete, return 'FINISH'.
-"""
 # ---------------- Imports ----------------
 from langgraph.graph import START, StateGraph, END
 from langgraph.graph.message import add_messages
@@ -79,7 +68,7 @@ tracks the data(Research & Draft) seperate each one so agent will not get confus
 class TeamState(TypedDict):
     messages : Annotated[list, add_messages]
     research_Summary: str
-    #draft_post: str
+    draft_posts: str
     next_agent: str
     permission: bool
 
@@ -98,6 +87,7 @@ def manager_agent(state: TeamState):
             permission(yes/no)
     """
     research_summary = state.get("research_Summary", "").strip()
+    draft_posts = state.get("draft_posts", "").strip()
     current_loop = state.get("loop_counter", 0)
     print(f"\t[RESEARCH_SUMMARY] -> {research_summary[:100]}")
     print(f"\t\t[CURRENT_LOOP] -> {current_loop}")
@@ -106,16 +96,19 @@ You are a Project Manager. Respond EXCLUSIVELY in English.
 Do not use Cyrillic or any other alphabet.
 
 TASK:
-Does the 'Current Research' below contain useful facts about the topic?
-- If it is empty, returns 'RESEARCHER'.
-- If it has facts, return 'FINISH'.
-
-CURRENT RESEARCH:
-{research_summary if research_summary else "None"}
+- If 'Current Research' is empty or insufficient, return 'RESEARCHER'.
+- If 'Current Research' is present but 'Current Draft' is empty, return 'WRITER'.
+- If the 'Current Draft' is complete and professional, return 'FINISH'.
 
 OUTPUT RULE:
-Return ONLY the word 'RESEARCHER' or 'FINISH'. 
-No explanations. No other languages.
+output exactly ONE word from the above option. 
+No explanations of the reasoning. 
+No other languages.
+
+STATE:
+{research_summary if research_summary else "None"}
+{draft_posts if draft_posts else "None"}
+
 """)
     response = llm.invoke([system_prompt])
     decision = response.content.strip().upper()
@@ -136,8 +129,8 @@ def route_manager(state: TeamState):
     
     if "RESEARCHER" in state['next_agent']:
         return "researcher"
-    #elif "WRITER" in state['next_agent']:
-    #    return "writer"
+    elif "WRITER" in state['next_agent']:
+        return "writer"
     return END
 
 # -------- Researcher Agent --------
@@ -155,11 +148,18 @@ def researcher_agent(state: TeamState) -> str:
     summarization LLM
     """
     system_prompt = SystemMessage(content = """
-You are a Researcher. 
-1. Use your tools to find facts, DO NOT MAKE THEM UP OR USE YOU PRETRAIN DATA.
-2. After using the tool, summarize the findings(DO NOT HALLUCINATE DATA )
-3. STRICT RULE: You must speak and summarize EXCLUSIVELY in English. 
-4. DO NOT use any non-English script!.
+You are a specialized Lead Researcher. Your task is to find and distill real-time information.
+
+YOUR MISSION:
+1) Use your tools to find facts about the topic provided.
+2) Extract key statistics, names, and current events.
+3) Summarize the findings into a structured list of facts.
+
+STRICT RULES:
+- ENGLISH ONLY. Never use any other language or script.
+- Do NOT write the social media post. Only provide the facts.
+- If the tool returns no data, admit it; do NOT hallucinate facts.
+- Provide source URLs for every major fact found.
 """)
     messages = [system_prompt] + state['messages']
     response = researcher_llm.invoke(messages) #return AImessage witch might contain tool 
@@ -175,16 +175,39 @@ def router_researcher(state: TeamState):
     return "manager"
 
 # -------- Writer Agent --------
-"""
-Turn research into a post(writes 3 Variations), dont have any tools
-    Input:
-        Research summary
-    Output:
-        Draft post
-"""
+def writer_agent(state: TeamState) -> str:
+    """
+    Turn research into a post(writes 3 Variations), dont have any tools
+        Input:
+            Research summary
+        Output:
+            Draft post
+    """
+    print("[WRITER_AGENT]")
+    research_summary = state["research_Summary"]
+    system_prompt = SystemMessage(content=f"""
+You are a Senior LinkedIn Copywriter. Your task is to turn raw research into high-engagement content.
 
+YOUR MISSION: Take the 'Research Summary' provided and create 3 distinct variations of a LinkedIn post:
+1) Variation A (The "Expert"): Professional, authoritative, and data-driven.
+2) Variation B (The "Contrarian"): Bold, challenging the status quo, and punchy.
+3) Variation C (The "Storyteller"): Relatable, narrative-driven, and conversational.
 
+STRICT RULES:
+- ENGLISH ONLY.
+- Do NOT use tools. Use only the provided research.
+- Use line breaks to make the posts readable (mobile-friendly).
+- Include 3 relevant hashtags at the bottom of each variation.
 
+DATA TO USE: {research_summary}
+""")
+    messages = [system_prompt] + state["messages"]
+    response = llm.invoke(messages)
+    return { "messages", [response]}
+
+def router_writer(state: TeamState):
+    print("[ROUTER_WRITER]")
+    return "manager"
 
 # ---------------- Graph ----------------
 workflow = StateGraph(TeamState)
@@ -192,6 +215,7 @@ workflow = StateGraph(TeamState)
 workflow.add_node("manager", manager_agent)
 workflow.add_node("researcher", researcher_agent)
 workflow.add_node("researcher_tools", researcher_tools)
+workflow.add_node("writer", writer_agent)
 
 workflow.add_edge(START,"manager") #entry point
 
