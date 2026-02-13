@@ -1,3 +1,4 @@
+#pip install langgraph langchain langchain_ollama ddgs newspaper3k lxml_html_clean grandalf
 """
 Content Engine
 Agent
@@ -17,7 +18,8 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 
 from typing import Annotated, TypedDict
 from langgraph.checkpoint.memory import MemorySaver
-
+import json
+from datetime import date
 from langchain_ollama import ChatOllama
 
 #tools
@@ -55,7 +57,7 @@ def research_topic(topic: str) -> str:
     return final_report
 
 # -------- Define LLM --------
-llm = ChatOllama(model="qwen2.5:14b", temperature=0.0)
+llm = ChatOllama(model="qwen2.5:7b-instruct-q4_K_M", temperature=0.0)
 
 researcher_llm = llm.bind_tools([research_topic])
 researcher_tools = ToolNode([research_topic])
@@ -74,8 +76,9 @@ class TeamState(TypedDict):
 
     loop_counter: int
 
-# ---------------- Agents ----------------
+    feed_back: str
 
+# ---------------- Agents ----------------
 # -------- Manager Agent --------
 def manager_agent(state: TeamState):
     print("[MANAGER]:")
@@ -86,38 +89,51 @@ def manager_agent(state: TeamState):
         Output:
             permission(yes/no)
     """
-    research_summary = state.get("research_Summary", "").strip()
-    draft_posts = state.get("draft_posts", "").strip()
+    research_summary = state.get("research_Summary", "EMPTY")
+    draft_posts = state.get("draft_posts", "EMPTY")
     current_loop = state.get("loop_counter", 0)
-    print(f"\t[RESEARCH_SUMMARY] -> {research_summary[:100]}")
+    last_msg = state["messages"][-1]
+    user_input = last_msg.content if isinstance(last_msg, HumanMessage) else "No new feedback"
+
     print(f"\t\t[CURRENT_LOOP] -> {current_loop}")
     system_prompt = SystemMessage(content = f"""
-You are a Project Manager. Respond EXCLUSIVELY in English. 
-Do not use Cyrillic or any other alphabet.
+You are Manager agent
 
-TASK:
-- If 'Current Research' is empty or insufficient, return 'RESEARCHER'.
-- If 'Current Research' is present but 'Current Draft' is empty, return 'WRITER'.
-- If the 'Current Draft' is complete and professional, return 'FINISH'.
+DECISION NEXT STEP:
+1. If 'Research' is EMPTY -> 'RESEARCHER'.
+2. If 'Research' exists but 'Draft Post' is EMPTY -> 'WRITER'.
+3. If User Input is feedback/edits -> 'WRITER'.
+4. otherwise -> 'FINISH'.
 
-OUTPUT RULE:
-output exactly ONE word from the above option. 
-No explanations of the reasoning. 
-No other languages.
+DATA:
+1. Research: {research_summary}
+2.  Draft Post: {draft_posts}
+3.  User Input: {user_input}
 
-STATE:
-{research_summary if research_summary else "None"}
-{draft_posts if draft_posts else "None"}
-
+OUTPUT VALID JSON ONLY:
+{{
+decision: "RESEARCHER | WRITER | FINISH",
+reason: "short explaining",
+}}
 """)
     response = llm.invoke([system_prompt])
-    decision = response.content.strip().upper()
-    if "FINISH" in decision:
-        final_decision = "FINISH"
-    else:
-        final_decision = "RESEARCHER"
-    print(f"\t[NEXT_AGENT] -> {final_decision}")
-    return {"next_agent" : final_decision, "loop_counter": current_loop + 1}
+    
+    try: 
+        data = json.loads(response.content)
+        print(f"\t\t[RESPONSE] -> {data}")
+        decision = data['decision'].upper()
+
+    except:
+        print("couldnt open as json")
+        decision = "FINISH"
+
+    print(f"\t[NEXT_AGENT] -> {decision}")
+    return {
+        "next_agent" : decision,
+        "loop_counter": current_loop + 1,
+        "feedback": user_input
+    
+    }
 
 
 def route_manager(state: TeamState):
@@ -147,24 +163,57 @@ def researcher_agent(state: TeamState) -> str:
     fetching data tool
     summarization LLM
     """
-    system_prompt = SystemMessage(content = """
-You are a specialized Lead Researcher. Your task is to find and distill real-time information.
+    # Filter messages: Keep only Human, AI Tool Calls, and Tool Results.
+    # Exclude the Manager's JSON decisions to save tokens.
+    filtered_messages = [
+        m for m in state["messages"] 
+        if isinstance(m, (HumanMessage, ToolMessage)) or (isinstance(m, AIMessage) and m.tool_calls)
+    ]
+    research_summary = state.get("research_Summary", "EMPTY")
+    feedback = state.get("feedback", "EMPTY")
+    system_prompt = SystemMessage(content = f"""
+You are a Researcher Agent
 
-YOUR MISSION:
-1) Use your tools to find facts about the topic provided.
-2) Extract key statistics, names, and current events.
-3) Summarize the findings into a structured list of facts.
+ROLE:
+- find and distill real-time information.
+- Use your tools to find facts about the provided topic.
+- Extract key statistics, names. and current events.
+- Summarize the finding into a structured list of facts
 
 STRICT RULES:
 - ENGLISH ONLY. Never use any other language or script.
 - Do NOT write the social media post. Only provide the facts.
 - If the tool returns no data, admit it; do NOT hallucinate facts.
 - Provide source URLs for every major fact found.
+
+DATA:
+1. Facts: {research_summary}
+2. current data: {date.today()}
+3. user feedback: {feedback}
+
+FEEDBACK CASE:
+if user requested more information try to fetch more information, if you couldnt find more information return "could not find more data".
+
+OUTPUT FORMAT:
+if you have facts return a JSON VALID OUTPUT
+{{
+summary : "list of facts",
+sources : "the sources that have been used",
+relativity : "how relevant the facts are for today, a double number between 0 - 1"
+}}
+else use your tools to get the facts
 """)
     messages = [system_prompt] + state['messages']
-    response = researcher_llm.invoke(messages) #return AImessage witch might contain tool 
-    if not response.tool_calls and len(response.content) > 10:
-        return { "messages" : [response], "research_Summary" : response.content}
+    response = researcher_llm.invoke(messages) #return AImessage which might contain tool
+    if not response.tool_calls:
+        try:
+            json_file = json.loads(response.content)
+            print(f"\t\t[SUMMARY] -> {len(json_file['summary'])}\n\t\t[SOURCES] -> {json_file['sources']}\n\t\t[RELATIVITY] -> {json_file['relativity']}")
+            return { "messages" : [response], "research_Summary" : json_file}
+        except:
+            print(f"(could not open as json!)\n\t\t[SUMMARY] -> {response.content}")
+            return {"messages": [response], "research_Summary": response.content}
+
     return {"messages" : [response]}
 
 def router_researcher(state: TeamState):
@@ -183,27 +232,43 @@ def writer_agent(state: TeamState) -> str:
         Output:
             Draft post
     """
-    print("[WRITER_AGENT]")
-    research_summary = state["research_Summary"]
-    system_prompt = SystemMessage(content=f"""
-You are a Senior LinkedIn Copywriter. Your task is to turn raw research into high-engagement content.
 
-YOUR MISSION: Take the 'Research Summary' provided and create 3 distinct variations of a LinkedIn post:
-1) Variation A (The "Expert"): Professional, authoritative, and data-driven.
-2) Variation B (The "Contrarian"): Bold, challenging the status quo, and punchy.
-3) Variation C (The "Storyteller"): Relatable, narrative-driven, and conversational.
+    print("[WRITER_AGENT]")
+    research_summary = state.get("research_Summary", "EMPTY")
+    existing_draft = state.get("draft_posts", "EMPTY")
+    feedback = state.get("feedback", "EMPTY")
+    system_prompt = SystemMessage(content=f"""
+You are a LinkedIn Expert agent. 
+
+TASK:
+Create or edit 3 variations(Expert, Contrarian, Storyteller)
+
+DATA:
+- Facts: {research_summary}
+- Current Draft: {existing_draft}
+- User feedback: {feedback}
 
 STRICT RULES:
-- ENGLISH ONLY.
-- Do NOT use tools. Use only the provided research.
-- Use line breaks to make the posts readable (mobile-friendly).
-- Include 3 relevant hashtags at the bottom of each variation.
+- English Only.
+- Output the full set of 3 variations, including your edits.
 
-DATA TO USE: {research_summary}
+OUTPUT VALID JASON ONLY, without any other characther:
+{{
+  Expert: "Expert version",
+  Contrarian: "Contrarian version",
+  Storyteller: "Storyteller version",
+  satisfaction: satisfied rate base on the feedback
+}}
 """)
-    messages = [system_prompt] + state["messages"]
-    response = llm.invoke(messages)
-    return { "messages", [response]}
+    response = llm.invoke([system_prompt])
+    print(response)
+    try:
+        data = json.loads(response.content)
+        print(f"\t\t[satisfaction] -> {data['satisfaction']}")
+        return {"messages": [response], "draft_posts": data}
+    except:
+        print("couldnt open as json")
+        return {"messages": [response], "draft_posts": {"Expert": response.content}}
 
 def router_writer(state: TeamState):
     print("[ROUTER_WRITER]")
@@ -223,6 +288,7 @@ workflow.add_conditional_edges("manager", route_manager)
 workflow.add_conditional_edges("researcher", router_researcher, {"researcher_tools": "researcher_tools","manager": "manager"})
 
 workflow.add_edge("researcher_tools", "researcher")#tools always go back to the researcher to explain(interpert) the results
+workflow.add_edge("writer", "manager")
 
 checkpointer = MemorySaver()
 app = workflow.compile(checkpointer=checkpointer)
