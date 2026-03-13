@@ -98,6 +98,8 @@ class Status(Enum):
     MULTIPLE_MATCHES = "MULTIPLE_MATCHES"
     ALREADY_EXISTS = "ALREADY_EXISTS"
 
+def normalize_time(dt):
+    return dt.replace(minute=(dt.minute // 15) * 15, second=0, microsecond=0)
 
 # =========================
 # VALIDATION FIREWALL
@@ -291,17 +293,43 @@ def get_tables_status_at_time(check_time):
     conn.close()
 
     return tables
-def check_availability(party_size, start_time):
+def check_availability(party_size, start_time_value):
     conn = get_connection()
+    
+    if isinstance(start_time_value, str):
+        start_time = datetime.strptime(start_time_value, "%Y-%m-%d %H:%M")
+    elif isinstance(start_time_value, datetime):
+        start_time = start_time_value
+    else:
+        raise ValueError("Invalid start_time format")
+    
+    start_time = start_time.replace(second=0, microsecond=0)
+    end_time = start_time + timedelta(hours=2)
+    print(f"times {start_time} -> {end_time}")
+    single = find_available_table(conn, party_size, start_time, end_time)
 
-    table = find_available_table(conn, party_size, start_time)
+    if single:
+        tables = [single]
+    else:
+        tables = find_available_tables_combined(conn, party_size, start_time, end_time)
+
+    if not tables:
+        alternatives = find_alternative_tables(conn,party_size,start_time)
+
+        return {
+            "status": "no_availability",
+            "alternatives": alternatives
+            }
 
     conn.close()
 
-    if table:
+    if tables:
+        tables_names = ""
+        for table in tables:
+            tables_names += f"{table["name"]}, "
         return {
             "status": "available",
-            "table": table["name"]
+            "tables": tables_names
         }
     else:
         return {
@@ -373,7 +401,6 @@ def find_available_tables_combined(conn,party_size,start_time,end_time):
         1) get all the available tables
         2) sort by smallest
         3) combine until total seats >= party_size
-
     """
     
     cursor = conn.cursor()
@@ -394,7 +421,9 @@ def find_available_tables_combined(conn,party_size,start_time,end_time):
             AND r.start_time < ?
             AND r.end_time > ?
         )
-    """, (start_time, end_time))
+    """, (end_time.strftime("%Y-%m-%d %H:%M"),
+        start_time.strftime("%Y-%m-%d %H:%M")
+    ))
     print("fetching")
     free_tables = cursor.fetchall()
     print("grouping by zone")
@@ -443,10 +472,10 @@ def create_reservation(name, phone, party_size, start_time_value):
         #Prevents double booking
         #Safer than default deferred transaction
         conn.execute("BEGIN IMMEDIATE")
-        print("single")
         single = find_available_table(conn, party_size, start_time, end_time)
 
         if single:
+            print("single")
             tables = [single]
         else:
             print("miltiple tables")
@@ -475,37 +504,21 @@ def create_reservation(name, phone, party_size, start_time_value):
         ))
 
         reservation_id = cursor.lastrowid
-        print(f"reserve found  tables")
-        print(f"{reservation_id}")
-
+        print(f"reserve found tables {reservation_id}")
+        print(f"table {tables[0]}, {tables[0]['id']}")
         for table in tables:
             cursor.execute("""
                 INSERT INTO reservation_tables (reservation_id, table_id)
                 VALUES (?, ?)
-            """, (reservation_id, table[0]))
+            """, (reservation_id, table['id']))
         print("commiting")
         conn.commit()
         print("success!")
 
-        # Convert sqlite3.Row to plain dict
-        clean_tables = []
-
-        for t in tables:
-            if isinstance(t, sqlite3.Row):
-                clean_tables.append(dict(t))
-            else:
-                # If tuple
-                clean_tables.append({
-                    "id": t[0],
-                    "name": t[1],
-                    "seats": t[2],
-                    "zone": t[3]
-                })
-
         return { 
             "status": "success",
             "reservation_id": reservation_id,
-            "tables": clean_tables,
+            "tables": tables,
             "start_time": start_time.strftime("%Y-%m-%d %H:%M"),
             "end_time": end_time.strftime("%Y-%m-%d %H:%M"),
         }
@@ -655,7 +668,13 @@ def get_last_user_message(state):
     for msg in reversed(state["messages"]):
         if msg.type == "human":
             return msg.content
-    return ""
+    return "no user message"
+
+def get_last_ai_message(state):
+    for msg in reversed(state["messages"]):
+        if msg.type == "ai":
+            return msg.content
+    return "no ai message"
 
 class ExtractSchema(BaseModel):
     name: Optional[str] = None
@@ -728,28 +747,46 @@ Output: UNKNOWN
     return state
 
 def extract_fields(state: AgentState):
-    recent_messages = state["messages"][-5:]
+    recent_messages = state["messages"][-4:]
+    missing_fields = state.get("missing_fields", [])
+    last_question = get_last_ai_message(state)
+    last_user = get_last_user_message(state)
     extract_prompt = f"""
-You are a strict information extraction engine.
+You are a strict information extraction engine for a restaurant reservation system.
+important: Extact the field base on the latest QUESTION and the user answer!!
+The assistant previously asked for:
+{missing_fields}
 
-Extract:
+latest question message:
+{last_question}
+
+User's answer message:
+{last_user}
+
+Extract these fields if present:
 
 - name
 - phone
 - party_size
-- start_time_raw (string, exact phrase from user like "today at 5pm")
+- start_time_raw
+
+Interpretation rules:
+
+If assistant asked for guests and user gives a number → party_size.
+
+If assistant asked for phone and user gives digits → phone.
+
+If assistant asked for name and user gives a word → name.
+
+If assistant asked for time and user gives something like
+"7", "7pm", "tonight", "tomorrow 8" → start_time_raw.
 
 Rules:
-- Return ONLY valid JSON.
+- Return ONLY JSON.
 - Missing fields must be null.
-- Never guess.
-- Never default to current time.
-- If the user did not explicitly specify a date/time, set start_time to null.
-
-If conversion is uncertain → return null.
+- Never guess unknown values.
 """
     structured_llm  = extract_llm .with_structured_output(ExtractSchema)
-
     response = structured_llm.invoke(
         [SystemMessage(content=extract_prompt)] + recent_messages
     )
@@ -758,39 +795,71 @@ If conversion is uncertain → return null.
     if extracted['start_time_raw'] is not None:
         start_time = parse_time(extracted['start_time_raw'])
         print(f"\t\t[extract_fields] -> {extracted}, start_time: {start_time}")
+        print(f"\t\tlast_question: {last_question}")
+
         state["start_time"] = start_time
     else:
         print(f"\t\t[extract_fields] -> {extracted}, start_time: None")
+        print(f"\t\tlast_question: {last_question}")
+
     for field, value in extracted.items():
         if value is not None:
             state[field] = value
     return state
 
 def check_missing(state: AgentState):
+    missing = []
+    print(f"\t\tmissing {missing}")
 
     required = {
-        "RESERVE": ["name", "phone", "party_size", "start_time"],
         "CHECK": ["name", "phone", "start_time"],
     }
+    if state["action"] == "RESERVE":
+        print(f"\t\t\t[reserve_1]")
+        if not state.get("party_size"):
+            missing.append("party_size")
+        
+        if not state.get("start_time"):
+            missing.append("start_time")
 
-    if state["action"] == "CANCEL":
+        if not missing:
+            result = check_availability(state["party_size"],state["start_time"])
+            print(f"\t\t\t[reserve_2] -> {result}")
+            state["tool_results"] = result
+            
+            if state["tool_results"]['status'] != "available":
+                print(f"\t\tunavailable")
+                state["missing_fields"] = missing
+                return state
+            
+            if not state.get("name"):
+                missing.append("name")
+
+            if not state.get("phone"):
+                missing.append("phone")
+
+    elif state["action"] == "CANCEL":
         handle_cancel_identity_resolution(state)
         missing = state["missing_fields"]
     else:
-        missing = []
-
         if state["action"] in required:
             for field in required[state["action"]]:
                 if not state.get(field):
                     missing.append(field)
-        state["missing_fields"] = missing
+    state["missing_fields"] = missing
 
-    print(f"\t\t[check_missing] -> {state['missing_fields']}")
+    print(f"\t\t[check_missing] -> {missing}")
     return state
 
 def route_after_check(state: AgentState):
     if state["missing_fields"]:
         return "ask_missing"
+    
+    if state["action"] == "RESERVE" and not state.get("name"):
+        return "ask_missing"
+    
+    if state.get("tool_results"):
+        return "intersept_results"
     return "execute_tool"
 
 def ask_missing(state: AgentState):
@@ -835,29 +904,55 @@ Time: {state.get("start_time")}"""
     )
 
     dynamic_context = "\n\n".join(context_blocks)
-    print(f"dynamic_context -> {dynamic_context}")
 
     ask_prompt = """
-You are a professional and friendly restaurant host.
-
-The guest is either:
-- Making a reservation
-- Cancelling a reservation
-
-Your task:
-Ask naturally and conversationally for ONLY the information needed next.
+You are a restaurant host speaking on the phone.
 
 Rules:
-- Be warm and human.
-- Do not mention system logic.
-- Do not repeat known details.
-- If disambiguating between multiple reservations, clearly present options and ask the guest to identify one.
-- If no reservation was found, gently suggest they may have used different details.
-- Keep it concise.
+- Keep responses VERY SHORT.
+- Maximum 10 words.
+- Ask only ONE question.
+- Speak naturally like a human host.
+- Do NOT explain anything.
 
-If one field is missing → ask directly.
-If multiple fields are missing → combine smoothly.
-If identity failed → gently request clarification.
+Examples, dont have to output the exact phrase:
+
+Examples:
+
+User wants reservation:
+
+Step 1:
+"What time would you like?"
+
+Step 2:
+"For how many guests?"
+
+Step 3 (if available):
+"May I have your name?"
+
+Step 4:
+"Phone number please?"
+
+Missing name:
+"May I have your name?"
+
+Missing phone:
+"what is your phone number?"
+
+Missing party size:
+"How many guests?"
+
+Missing time:
+"What time would you like?"
+
+If multiple details missing:
+"what are your name and phone number."
+
+If multiple reservations found:
+"Which one? Tell me the time."
+
+If identity failed:
+"I couldn't find it. Name again please."
 """
 
     response = conversation_llm.invoke([
@@ -866,6 +961,7 @@ If identity failed → gently request clarification.
     ])
 
     print(f"\t\t[ask_missing] -> {missing}")
+    print(f"dynamic_context -> {dynamic_context}")
     print(f"\t\t response: {response.content}")
 
     state["messages"].append(AIMessage(content=response.content))
@@ -915,19 +1011,32 @@ def intersept_results(state: AgentState):
     result = state["tool_results"]
     print(f"\t\t[intersept_results] -> {result}")
     intersept_prompt = f"""
-You are a professional restaurant host assistant.
+You are a restaurant host speaking on the phone.
 
-You are given a backend result JSON.
-Generate a clear and polite response for the customer.
-action taken: {action}
+Respond in **one short sentence (max 12 words)**.
+
 Rules:
-- Be concise.
-- Be professional.
-- Do not expose internal system status codes.
-- If reservation is successful, confirm details.
-- If no table available, suggest alternatives if provided.
-- If multiple matches found, ask for clarification.
-- If not found, politely inform the user.
+- Be clear.
+- Be brief.
+- No explanations.
+- No system wording.
+
+Examples:
+
+Reservation success:
+"You're booked for 7 PM."
+
+Reservation success with details:
+"Reservation confirmed for 4 at 7 PM."
+
+No table:
+"No table at 7. 7:30 or 8 available."
+
+Multiple matches:
+"I found two bookings. What time was it?"
+
+Not found:
+"I couldn't find that reservation."
 """
     response = conversation_llm .invoke([
         SystemMessage(content=intersept_prompt),
@@ -936,6 +1045,7 @@ Rules:
 
     print(f"\t[response content] ->{response.content}")
     state["messages"].append(AIMessage(content=response.content))
+    state["tool_results"] = None
 
     return state
 
@@ -1056,7 +1166,8 @@ workflow.add_conditional_edges(
     route_after_check,
     {
         "ask_missing": "ask_missing",
-        "execute_tool": "execute_tool"
+        "execute_tool": "execute_tool",
+        "intersept_results": "intersept_results"
     }
 )
 workflow.add_edge("ask_missing", END)#reaching out to the user, and redoing the whole steps if action was changed
@@ -1404,7 +1515,7 @@ checkpointer = MemorySaver()
 chat_app = workflow.compile(checkpointer=checkpointer)
 
 config = {"configurable" : {"thread_id" : "test"}}
-#seed_random_reservations(20)
+seed_random_reservations(20)
 print(chat_app.get_graph().draw_ascii())
 
 
