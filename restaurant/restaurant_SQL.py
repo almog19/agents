@@ -47,8 +47,10 @@ calling the tool
 import sqlite3
 from dateutil import parser
 from datetime import datetime, timedelta
+import dateparser
 from enum import Enum
 import re
+
 
 from pydantic import BaseModel
 
@@ -84,6 +86,7 @@ DB_PATH = "restaurant.db"
 RESERVATION_DURATION_HOURS = 2
 OPEN_HOUR = 10
 CLOSE_HOUR = 23
+BUFFER_MINUTES = 15
 
 
 # =========================
@@ -91,42 +94,13 @@ CLOSE_HOUR = 23
 # =========================
 
 class Status(Enum):
-    SUCCESS = "SUCCESS"
+    SUCCESS_RESERVE = "RESERVED"
+    SUCCESS_CANCEL = "CANCELLED"
     INVALID_INPUT = "INVALID_INPUT"
     NO_TABLE_AVAILABLE = "NO_TABLE_AVAILABLE"
     NOT_FOUND = "NOT_FOUND"
     MULTIPLE_MATCHES = "MULTIPLE_MATCHES"
     ALREADY_EXISTS = "ALREADY_EXISTS"
-
-def normalize_time(dt):
-    return dt.replace(minute=(dt.minute // 15) * 15, second=0, microsecond=0)
-
-# =========================
-# VALIDATION FIREWALL
-# =========================
-
-def validate_reservation_input(name, phone, party_size, start_time_value):
-    if not name or len(name.strip()) < 2:
-        return False, "Invalid name"
-
-    if not re.match(r"^\+?\d{8,15}$", phone):
-        return False, "Invalid phone"
-
-    if party_size <= 0:
-        return False, "Invalid party size"
-
-    if isinstance(start_time_value, str):
-        start_time = datetime.strptime(start_time_value, "%Y-%m-%d %H:%M")
-    elif isinstance(start_time_value, datetime):
-        start_time = start_time_value
-    else:
-        raise ValueError("Invalid start_time format")
-
-    if start_time.hour < OPEN_HOUR or start_time.hour >= CLOSE_HOUR:
-        return False, "Outside opening hours"
-
-    return True, None
-
 
 # =========================
 # DB CONNECTION
@@ -223,13 +197,17 @@ def cleanup_expired_reservations():
     conn.commit()
     conn.close()
 
+def normalize_time(dt):
+    return dt.replace(minute=(dt.minute // 15) * 15, second=0, microsecond=0)
+
+
 # =========================
 # CHECK TABLE AVAILABILITY
 # =========================
 
 def find_available_table(conn, party_size, start_time, end_time):
     cursor = conn.cursor()
-
+    start_time = normalize_time(start_time)
     query = """
     SELECT t.id, t.name, t.seats, t.zone
     FROM tables t
@@ -302,10 +280,9 @@ def check_availability(party_size, start_time_value):
         start_time = start_time_value
     else:
         raise ValueError("Invalid start_time format")
-    
-    start_time = start_time.replace(second=0, microsecond=0)
+    start_time = normalize_time(start_time)
     end_time = start_time + timedelta(hours=2)
-    print(f"times {start_time} -> {end_time}")
+    #print(f"times {start_time} -> {end_time}")
     single = find_available_table(conn, party_size, start_time, end_time)
 
     if single:
@@ -369,29 +346,55 @@ def find_reservations(name=None, phone=None, start_time=None):
         })
 
     return results
-def find_alternative_tables(conn,party_size,start_time,duration_hours=2):
-    suggestions = []
-    offsets = [30,-30,60,-60,90,-90]
+def find_alternative_tables(conn, party_size, start_time, duration_hours=2):
 
-    for minutes in offsets:
-        new_start = start_time + timedelta(minutes=minutes)
+    suggestions = []
+
+    now = datetime.now()
+    buffer_minutes = 15
+    earliest_allowed = now + timedelta(minutes=buffer_minutes)
+
+    search_window_before = 60
+    search_window_after = 120
+    step_minutes = 15
+
+    start_range = start_time - timedelta(minutes=search_window_before)
+    end_range = start_time + timedelta(minutes=search_window_after)
+
+    t = start_range
+
+    while t <= end_range:
+
+        # Skip past times and closed time
+        if t < earliest_allowed or t.hour < OPEN_HOUR:
+            t += timedelta(minutes=step_minutes)
+            continue
+
+        new_start = t
         new_end = new_start + timedelta(hours=duration_hours)
 
+        #no further search(close hour)
+        if new_end.hour > CLOSE_HOUR and new_end.hour < OPEN_HOUR:
+            break
+
         single = find_available_table(conn, party_size, new_start, new_end)
-        
+
         if single:
             tables = [single]
         else:
             tables = find_available_tables_combined(conn, party_size, new_start, new_end)
 
         if tables:
+
             suggestions.append({
-                "start_time": new_start.strftime("%Y-%m-%d %H:%M"),
-                "end_time": new_end.strftime("%Y-%m-%d %H:%M")
+                "start_time": new_start.strftime("%H:%M"),
+                "tables": tables
             })
-        
-        if len(suggestions) > 3:
+
+        if len(suggestions) >= 3:
             break
+
+        t += timedelta(minutes=step_minutes)
 
     return suggestions
 def find_available_tables_combined(conn,party_size,start_time,end_time):
@@ -404,7 +407,7 @@ def find_available_tables_combined(conn,party_size,start_time,end_time):
     """
     
     cursor = conn.cursor()
-    print("execute combine")
+    #print("execute combine")
     # Get all free tables at this time
     cursor.execute("""
         SELECT 
@@ -424,27 +427,27 @@ def find_available_tables_combined(conn,party_size,start_time,end_time):
     """, (end_time.strftime("%Y-%m-%d %H:%M"),
         start_time.strftime("%Y-%m-%d %H:%M")
     ))
-    print("fetching")
+    #print("fetching")
     free_tables = cursor.fetchall()
-    print("grouping by zone")
+    #print("grouping by zone")
     # Group by zone
     grouped = defaultdict(list)
     for table in free_tables:
         grouped[table[3]].append(table)  # table[3] = zone
-    print("checking each zone")
+    #print("checking each zone")
     # Try each zone separately
     for zone, tables in grouped.items():
-        print("sort small to large")
+        #print("sort small to large")
         # sort small to large (minimize wasted seats)
         tables.sort(key=lambda x: x[2])
-        print("try combining up to 3 tables")
+        #print("try combining up to 3 tables")
         # Try combinations up to 3 tables (safe limit)
         for r in range(1, min(4, len(tables)+1)):
             for combo in itertools.combinations(tables, r):
                 total_seats = sum(t[2] for t in combo)
                 if total_seats >= party_size:
                     return list(combo)
-    print("ends")
+    #print("ends")
     return None
 
 # =========================
@@ -463,7 +466,7 @@ def create_reservation(name, phone, party_size, start_time_value):
         start_time = start_time_value
     else:
         raise ValueError("Invalid start_time format")
-    
+    start_time = normalize_time(start_time)
     start_time = start_time.replace(second=0, microsecond=0)
     end_time = start_time + timedelta(hours=2)
     
@@ -516,7 +519,7 @@ def create_reservation(name, phone, party_size, start_time_value):
         print("success!")
 
         return { 
-            "status": "success",
+            "status": "RESERVED",
             "reservation_id": reservation_id,
             "tables": tables,
             "start_time": start_time.strftime("%Y-%m-%d %H:%M"),
@@ -583,7 +586,7 @@ def cancel_reservation(name=None, phone=None, start_time=None):
     conn.commit()
     conn.close()
 
-    return {"status": Status.SUCCESS.value}
+    return {"status": Status.SUCCESS_CANCEL.value}
 
 class CreateReservationInput(BaseModel):
     name: str
@@ -644,26 +647,11 @@ class AgentState(TypedDict):
     loop_count: int
     candidates: List[str]
     target_reservation: str
-    identity_failed: bool
+
 
 # -----------------------
-# Nodes
+# helpers
 # -----------------------
-intent_llm = ChatOllama(
-    model="qwen2.5:7b-instruct-q4_K_M",
-    temperature=0.0
-)
-
-extract_llm = ChatOllama(
-    model="qwen2.5:7b-instruct-q4_K_M",
-    temperature=0.0
-)
-
-conversation_llm = ChatOllama(
-    model="qwen2.5:7b-instruct-q4_K_M",
-    temperature=0.3
-)
-
 def get_last_user_message(state):
     for msg in reversed(state["messages"]):
         if msg.type == "human":
@@ -682,13 +670,75 @@ class ExtractSchema(BaseModel):
     party_size: Optional[int] = None
     start_time_raw: Optional[str] = None
 
-def parse_time(raw_text):
-    try:
-        dt = parser.parse(raw_text, fuzzy=True)
-        return dt.strftime("%Y-%m-%d %H:%M")
-    except:
-        return None 
-    
+def parse_time(text):
+    now = datetime.now()
+
+    parsed = dateparser.parse(
+        text,
+        settings={
+            "PREFER_DATES_FROM": "future",
+            "RELATIVE_BASE": now
+        }
+    )
+
+    if not parsed:
+        return None
+
+    parsed = parsed.replace(second=0, microsecond=0)
+    parsed = normalize_time(parsed)
+
+    print(f"\t\t{parsed}")
+    return parsed
+
+def validate_input(state):
+
+    errors = {}
+
+    start_time = state.get("start_time")
+
+    if start_time:
+        if start_time.hour < OPEN_HOUR or start_time.hour >= CLOSE_HOUR:
+            errors["start_time"] = "outside_opening_hours"
+
+    party_size = state.get("party_size")
+
+    if party_size is not None:
+        if party_size <= 0:
+            errors["party_size"] = "party_size is zero or negative"
+
+    phone = state.get("phone")
+
+    if phone:
+        if not re.match(r"^\+?\d{8,15}$", phone):
+            errors["phone"] = "invalid_phone phone number"
+
+    if not errors:
+        return {"status": "valid"}
+
+    return {
+        "status": "invalid",
+        "fields": list(errors.keys()),
+        "errors": errors
+    }
+
+# -----------------------
+# Nodes
+# -----------------------
+intent_llm = ChatOllama(
+    model="qwen2.5:7b-instruct-q4_K_M",
+    temperature=0.0
+)
+
+extract_llm = ChatOllama(
+    model="qwen2.5:7b-instruct-q4_K_M",
+    temperature=0.0
+)
+
+conversation_llm = ChatOllama(
+    model="qwen2.5:7b-instruct-q4_K_M",
+    temperature=0.4
+)
+
 def detect_intend(state: AgentState):
     user_input = get_last_user_message(state)
     prev_action = state.get("action", "UNKNOWN")
@@ -778,8 +828,8 @@ If assistant asked for phone and user gives digits → phone.
 
 If assistant asked for name and user gives a word → name.
 
-If assistant asked for time and user gives something like
-"7", "7pm", "tonight", "tomorrow 8" → start_time_raw.
+If assistant asked for time and user gives something relative to time
+"now", "in an hour", "7", "7pm", "tonight", "tomorrow 8" → start_time_raw.
 
 Rules:
 - Return ONLY JSON.
@@ -801,10 +851,10 @@ Rules:
     else:
         print(f"\t\t[extract_fields] -> {extracted}, start_time: None")
         print(f"\t\tlast_question: {last_question}")
-
     for field, value in extracted.items():
         if value is not None:
             state[field] = value
+    print(f"\t\t[variables] -> {state.get('name',"-")}, {state.get('phone',"-")}, {state.get('party_size',"-")}, {state.get('start_time_raw',"-")}({state.get('start_time',"-")})")
     return state
 
 def check_missing(state: AgentState):
@@ -855,89 +905,114 @@ def route_after_check(state: AgentState):
     if state["missing_fields"]:
         return "ask_missing"
     
-    if state["action"] == "RESERVE" and not state.get("name"):
-        return "ask_missing"
-    
-    if state.get("tool_results"):
+    if state.get("tool_results") and state["tool_results"]['status'] != "available":
         return "intersept_results"
+    
     return "execute_tool"
 
 def ask_missing(state: AgentState):
+
     state["loop_count"] += 1
-    
+
     if state["loop_count"] > 6:
         state["messages"].append(
-            AIMessage(content="I'm having trouble finding that reservation. Let’s start fresh — how can I help you today?")
+            AIMessage(content="I'm having trouble. Let's start over.")
         )
         return state
-    
+
+
+    # =========================
+    # VALIDATION CHECK
+    # =========================
+
     missing = state["missing_fields"]
+    
+    invalid = validate_input(state)
+    if invalid["status"] == "invalid":
+        missing = "None"
+
     action = state.get("action")
     candidates = state.get("candidates")
     identity_failed = state.get("identity_failed")
 
+
+    # =========================
+    # BUILD CONTEXT
+    # =========================
+
     context_blocks = []
 
-    context_blocks.append(f"action: {action}")
+    context_blocks.append(f"Action: {action}")
     context_blocks.append(f"Missing fields: {missing}")
+
+    if invalid["status"] == "invalid":
+        context_blocks.append(f"Invalid fields: {invalid['fields']}")
+        context_blocks.append(f"Error reasons: {invalid['errors']}")
 
     if candidates:
         options = []
         for i, r in enumerate(candidates, 1):
+
             options.append(
                 f"{i}. {r['customer_name']} - "
-                f"{parse_time(r['start_time'])} - "
+                f"{r['start_time']} - "
                 f"Party of {r['party_size']}"
             )
+
         context_blocks.append("Multiple reservations found:")
         context_blocks.append("\n".join(options))
 
     if identity_failed:
         context_blocks.append("No reservation matched the provided details.")
 
+
     context_blocks.append(
-        f"""Already known:
+f"""Already known:
 Name: {state.get("name")}
 Phone: {state.get("phone")}
 Party size: {state.get("party_size")}
 Time: {state.get("start_time")}"""
     )
 
+
     dynamic_context = "\n\n".join(context_blocks)
 
-    ask_prompt = """
+
+    # =========================
+    # HOST PROMPT
+    # =========================
+
+    ask_prompt = f"""
 You are a restaurant host speaking on the phone.
 
 Rules:
-- Keep responses VERY SHORT.
-- Maximum 10 words.
+- Maximum 10 words, start with the critical part of the sentence.
 - Ask only ONE question.
 - Speak naturally like a human host.
-- Do NOT explain anything.
+- Do NOT explain.
 
-Examples, dont have to output the exact phrase:
+Priority rules:
+1. If a field is INVALID → ask to fix it.
+2. Otherwise ask for MISSING fields.
 
-Examples:
+Invalid examples:
 
-User wants reservation:
+Invalid phone:
+"That phone number looks wrong. Could you repeat it?"
 
-Step 1:
-"What time would you like?"
+Invalid party size:
+"How many guests will be dining?"
 
-Step 2:
-"For how many guests?"
+Invalid time (open hour{OPEN_HOUR}, close hour{CLOSE_HOUR}):
+"We're closed then. What time works instead?"
 
-Step 3 (if available):
-"May I have your name?"
-
-Step 4:
-"Phone number please?"
+Missing examples:
 
 Missing name:
 "May I have your name?"
 
 Missing phone:
-"what is your phone number?"
+"Phone number please?"
 
 Missing party size:
 "How many guests?"
@@ -945,26 +1020,27 @@ Missing party size:
 Missing time:
 "What time would you like?"
 
-If multiple details missing:
-"what are your name and phone number."
+Multiple reservations:
+"Which reservation? Tell me the time."
 
-If multiple reservations found:
-"Which one? Tell me the time."
-
-If identity failed:
+Identity failed:
 "I couldn't find it. Name again please."
 """
+
 
     response = conversation_llm.invoke([
         SystemMessage(content=ask_prompt),
         HumanMessage(content=dynamic_context)
     ])
 
+
     print(f"\t\t[ask_missing] -> {missing}")
-    print(f"dynamic_context -> {dynamic_context}")
-    print(f"\t\t response: {response.content}")
+    print(f"\t\tcontext -> {dynamic_context}")
+    print(f"\t\tresponse -> {response.content}")
+
 
     state["messages"].append(AIMessage(content=response.content))
+
     return state
 
 def execute_tool(state: AgentState):
@@ -1007,43 +1083,49 @@ def execute_tool(state: AgentState):
     return state
 
 def intersept_results(state: AgentState):
-    action = state["action"]    
     result = state["tool_results"]
     print(f"\t\t[intersept_results] -> {result}")
     intersept_prompt = f"""
-You are a restaurant host speaking on the phone.
+You are a friendly restaurant host.
 
-Respond in **one short sentence (max 12 words)**.
+Reservation system result:
+{result}
 
+never hellucinate data!
+
+make it as SHORT as possible but include all the necessary information(12 words max!)
 Rules:
-- Be clear.
-- Be brief.
-- No explanations.
-- No system wording.
 
-Examples:
+If status = "reserved":
+Confirm the reservation including the name, time and number of guests.
 
-Reservation success:
-"You're booked for 7 PM."
+If status = "cancelled":
+Confirm the reservation was cancelled including the name, and time.
 
-Reservation success with details:
-"Reservation confirmed for 4 at 7 PM."
+If status = "no_tables":
+Politely apologize and suggest the alternative times if presented(DONT HELLUCIANTE THEM).
 
-No table:
-"No table at 7. 7:30 or 8 available."
+If status = "error":
+Ask the guest to try again.
 
-Multiple matches:
-"I found two bookings. What time was it?"
+Style:
+Friendly restaurant host speaking to a guest.
 
-Not found:
-"I couldn't find that reservation."
+Examples (style only, do NOT copy):
+
+Reserved:
+"Perfect! Your table for two at 19:00 is all set."
+
+No tables:
+"I'm sorry, we're fully booked at 19:00, but I can offer 18:30 or 21:00."
+
+Now generate the correct response.
 """
     response = conversation_llm .invoke([
         SystemMessage(content=intersept_prompt),
-        HumanMessage(content=json.dumps(result))
     ])
 
-    print(f"\t[response content] ->{response.content}")
+    print(f"\t[response content] ->{result}\n\t\t{response.content}")
     state["messages"].append(AIMessage(content=response.content))
     state["tool_results"] = None
 
